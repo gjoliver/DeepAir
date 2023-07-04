@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 NUM_WORKERS = 3
 
 
