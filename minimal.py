@@ -5,7 +5,7 @@ using tiny_shakespeare dataset with Ray AIR's TorchTrainer.
 
 from typing import Any, Dict, Tuple
 
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
 import deepspeed
 import ray
 from ray.air import session
@@ -14,10 +14,12 @@ from ray.air.config import ScalingConfig
 from ray.air.config import RunConfig
 from ray.air.config import CheckpointConfig
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
 BATCH_SIZE = 16
+NUM_WORKERS = 3
 
 
 def get_model() -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
@@ -32,7 +34,7 @@ def get_model() -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
 
 def get_datasets(
     tokenizer: AutoTokenizer, world_size: int, rank: int
-) -> ray.data.Dataset:
+) -> Dataset:
     """Download and pre-process the datasets."""
     datasets = load_dataset("tiny_shakespeare")
 
@@ -42,13 +44,20 @@ def get_datasets(
         return {"text": lines}
 
     def tokenize(row):
-        return tokenizer(
+        inputs = tokenizer(
             row["text"],
             max_length=tokenizer.model_max_length,
             truncation=True,
             padding="max_length",
             return_tensors="np",
         )
+        label = inputs.input_ids.copy()[1:]
+        return {
+            "input_ids": inputs.input_ids,
+            # Trick to make sure attention mask is bool.
+            "attention_mask": (inputs.attention_mask > 0),
+            "labels": label,
+        }
 
     def preprocess(ds):
         return ds.map(
@@ -69,8 +78,20 @@ def _to_device(batch):
     return output
 
 
-def loss_fn(logits, batch):
-    pass
+def _loss_fn(logits, batch):
+    shift_logits = logits[..., :-1, :].contiguous()
+    labels = batch["labels"].contiguous().long()
+    return F.cross_entropy(
+        shift_logits.view(-1, shift_logits.size(-1)),
+        labels.view(-1),
+    )
+
+
+def _collate_fn(batch):
+    return {
+        key: torch.stack([torch.tensor(r[key]) for r in batch])
+        for key in ["input_ids", "attention_mask", "labels"]
+    }
 
 
 def train_loop_per_worker(config: Dict[str, Any]):
@@ -78,12 +99,14 @@ def train_loop_per_worker(config: Dict[str, Any]):
 
     model, tokenizer = get_model()
 
-    train_dataset = get_datasets(
+    ds = get_datasets(
         tokenizer,
         session.get_world_size(),
         session.get_world_rank(),
     )
-    data_loader = torch.utils.data.DataLoader(train_dataset, batch_size=BATCH_SIZE)
+    data_loader = torch.utils.data.DataLoader(
+        ds, batch_size=BATCH_SIZE, collate_fn=_collate_fn,
+    )
 
     model, _, _, _ = deepspeed.initialize(
         model=model,
@@ -119,30 +142,29 @@ def train_loop_per_worker(config: Dict[str, Any]):
     )
 
     # For demo purpose, we only train 1 epoch.
-    for batch in data_loader:
-        batch = _to_device(batch)
-        outputs = model(
-            input_ids=batch["input_ids"],
-            # Trick to make sure attention mask is bool.
-            attention_mask=(batch["attention_mask"] > 0),
-        )
+    for step, batch in enumerate(data_loader):
+        outputs = model(**_to_device(batch))
 
-        loss = loss_fn(outputs["logits"], batch)
+        loss = _loss_fn(outputs["logits"], batch)
 
         # DeepSpeed engine handles backward and step.
         model.backward(loss)
         model.step()
         model.zero_grad()
 
-        session.report({"loss": loss.cpu()})
+        session.report({
+            "step": step,
+            "loss": torch.mean(loss).cpu().numpy(),
+        })
 
 
 def train():
     """Main entry point."""
     trainer = TorchTrainer(
         train_loop_per_worker=train_loop_per_worker,
-        scaling_config=ScalingConfig(num_workers=3, use_gpu=False),
-        run_config=RunConfig(checkpoint_config=CheckpointConfig()),
+        scaling_config=ScalingConfig(
+            num_workers=NUM_WORKERS, use_gpu=True
+        ),
     )
 
     result = trainer.fit()
