@@ -22,6 +22,7 @@ from transformers.deepspeed import HfDeepSpeedConfig
 
 BATCH_SIZE = 8
 NUM_WORKERS = 4
+IGNORE_INDEX = -100
 
 
 def get_model() -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
@@ -53,12 +54,16 @@ def get_datasets(tokenizer: AutoTokenizer, world_size: int, rank: int) -> Datase
             padding="max_length",
             return_tensors="np",
         )
-        label = inputs.input_ids.copy()[:, 1:]
+
+        labels = inputs.input_ids.copy()[:, 1:]
+        # We used eos_token as the pad token.
+        labels[labels == tokenizer.eos_token_id] = IGNORE_INDEX
+
         return {
             "input_ids": inputs.input_ids,
             # Trick to make sure attention mask is bool.
             "attention_mask": (inputs.attention_mask > 0),
-            "labels": label,
+            "labels": labels,
         }
 
     def preprocess(ds):
@@ -86,6 +91,7 @@ def _loss_fn(logits, labels):
     return F.cross_entropy(
         shift_logits.view(-1, shift_logits.size(-1)),
         labels.view(-1),
+        ignore_index=IGNORE_INDEX,
     )
 
 
@@ -149,7 +155,10 @@ def train_loop_per_worker(config: Dict[str, Any]):
 
     # For demo purpose, we only train 1 epoch.
     for step, batch in enumerate(data_loader):
-        outputs = model(**_to_device(batch))
+        batch = _to_device(batch)
+        outputs = model(
+            input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]
+        )
 
         loss = _loss_fn(outputs["logits"], batch["labels"])
 
@@ -160,7 +169,7 @@ def train_loop_per_worker(config: Dict[str, Any]):
 
         session.report({
             "step": step,
-            "loss": torch.mean(loss).cpu().numpy(),
+            "loss": torch.mean(loss).detach().cpu().numpy(),
         })
 
 
