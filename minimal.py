@@ -17,9 +17,11 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from transformers.deepspeed import HfDeepSpeedConfig
+
 
 BATCH_SIZE = 8
-NUM_WORKERS = 3
+NUM_WORKERS = 4
 
 
 def get_model() -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
@@ -32,15 +34,15 @@ def get_model() -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
     return model, tokenizer
 
 
-def get_datasets(
-    tokenizer: AutoTokenizer, world_size: int, rank: int
-) -> Dataset:
+def get_datasets(tokenizer: AutoTokenizer, world_size: int, rank: int) -> Dataset:
     """Download and pre-process the datasets."""
     datasets = load_dataset("tiny_shakespeare")
 
     def split(rows):
         lines = []
-        for row in rows["text"]: lines.extend(row.split("\n"))
+        for row in rows["text"]: lines.extend(
+            [r for r in row.split("\n") if r]  # Skip empty strings.
+        )
         return {"text": lines}
 
     def tokenize(row):
@@ -51,7 +53,7 @@ def get_datasets(
             padding="max_length",
             return_tensors="np",
         )
-        label = inputs.input_ids.copy()[1:]
+        label = inputs.input_ids.copy()[:, 1:]
         return {
             "input_ids": inputs.input_ids,
             # Trick to make sure attention mask is bool.
@@ -65,7 +67,7 @@ def get_datasets(
         ).shard(
             num_shards=world_size, index=rank
         ).map(
-            tokenize, remove_columns=["text"]
+            tokenize, batched=True, remove_columns=["text"]
         )
 
     return preprocess(datasets["train"])
@@ -78,9 +80,9 @@ def _to_device(batch):
     return output
 
 
-def _loss_fn(logits, batch):
+def _loss_fn(logits, labels):
     shift_logits = logits[..., :-1, :].contiguous()
-    labels = batch["labels"].contiguous().long()
+    labels = labels.contiguous().long()
     return F.cross_entropy(
         shift_logits.view(-1, shift_logits.size(-1)),
         labels.view(-1),
@@ -119,8 +121,12 @@ def train_loop_per_worker(config: Dict[str, Any]):
                     "lr": 1e-5,
                 }
             },
-            "bf16": {
+            "fp16": {
                 "enabled": True
+            },
+            "bf16": {
+                # Turn this on if using AMPERE GPUs.
+                "enabled": False
             },
             "zero_optimization": {
                 "stage": 3,
@@ -145,7 +151,7 @@ def train_loop_per_worker(config: Dict[str, Any]):
     for step, batch in enumerate(data_loader):
         outputs = model(**_to_device(batch))
 
-        loss = _loss_fn(outputs["logits"], batch)
+        loss = _loss_fn(outputs["logits"], batch["labels"])
 
         # DeepSpeed engine handles backward and step.
         model.backward(loss)
