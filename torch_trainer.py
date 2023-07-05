@@ -3,103 +3,19 @@ For demo purpose, a minimal job showing how to Fine-tune gpt2
 using tiny_shakespeare dataset with Ray AIR's TorchTrainer.
 """
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict
 
-from datasets import Dataset, load_dataset
 import deepspeed
-import ray
 from ray.air import session
 from ray.train.torch import TorchTrainer
 from ray.air.config import ScalingConfig
-from ray.air.config import RunConfig
-from ray.air.config import CheckpointConfig
 import torch
-import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from transformers.deepspeed import HfDeepSpeedConfig
+from util import collate_fn, get_datasets, get_model, loss_fn, to_device
 
 
 BATCH_SIZE = 8
 NUM_WORKERS = 4
-IGNORE_INDEX = -100
-
-
-def get_model() -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
-    MODEL = "gpt2"
-
-    model = AutoModelForCausalLM.from_pretrained(MODEL)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
-    tokenizer.pad_token = tokenizer.eos_token
-
-    return model, tokenizer
-
-
-def get_datasets(tokenizer: AutoTokenizer, world_size: int, rank: int) -> Dataset:
-    """Download and pre-process the datasets."""
-    datasets = load_dataset("tiny_shakespeare")
-
-    def split(rows):
-        lines = []
-        for row in rows["text"]: lines.extend(
-            [r for r in row.split("\n") if r]  # Skip empty strings.
-        )
-        return {"text": lines}
-
-    def tokenize(row):
-        inputs = tokenizer(
-            row["text"],
-            max_length=tokenizer.model_max_length,
-            truncation=True,
-            padding="max_length",
-            return_tensors="np",
-        )
-
-        labels = inputs.input_ids.copy()[:, 1:]
-        # We used eos_token as the pad token.
-        labels[labels == tokenizer.eos_token_id] = IGNORE_INDEX
-
-        return {
-            "input_ids": inputs.input_ids,
-            # Trick to make sure attention mask is bool.
-            "attention_mask": (inputs.attention_mask > 0),
-            "labels": labels,
-        }
-
-    def preprocess(ds):
-        return ds.map(
-            split, batched=True,
-        ).shard(
-            num_shards=world_size, index=rank
-        ).map(
-            tokenize, batched=True, remove_columns=["text"]
-        )
-
-    return preprocess(datasets["train"])
-
-
-def _to_device(batch):
-    output = {}
-    for k, v in batch.items():
-        output[k] = v.to(torch.device("cuda"))
-    return output
-
-
-def _loss_fn(logits, labels):
-    shift_logits = logits[..., :-1, :].contiguous()
-    labels = labels.contiguous().long()
-    return F.cross_entropy(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        labels.view(-1),
-        ignore_index=IGNORE_INDEX,
-    )
-
-
-def _collate_fn(batch):
-    return {
-        key: torch.stack([torch.tensor(r[key]) for r in batch])
-        for key in ["input_ids", "attention_mask", "labels"]
-    }
 
 
 def train_loop_per_worker(config: Dict[str, Any]):
@@ -113,7 +29,7 @@ def train_loop_per_worker(config: Dict[str, Any]):
         session.get_world_rank(),
     )
     data_loader = torch.utils.data.DataLoader(
-        ds, batch_size=BATCH_SIZE, collate_fn=_collate_fn,
+        ds, batch_size=BATCH_SIZE, collate_fn=collate_fn,
     )
 
     model, _, _, _ = deepspeed.initialize(
@@ -155,12 +71,12 @@ def train_loop_per_worker(config: Dict[str, Any]):
 
     # For demo purpose, we only train 1 epoch.
     for step, batch in enumerate(data_loader):
-        batch = _to_device(batch)
+        batch = to_device(batch)
         outputs = model(
             input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]
         )
 
-        loss = _loss_fn(outputs["logits"], batch["labels"])
+        loss = loss_fn(outputs["logits"], batch["labels"])
 
         # DeepSpeed engine handles backward and step.
         model.backward(loss)
