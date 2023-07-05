@@ -1,14 +1,12 @@
 """
 A minimal job showing how to Fine-tune gpt2 with tiny_shakespeare dataset
-using DeepSpeed and Ray AIR's TorchTrainer.
+using DeepSpeed and Ray core library directly.
+
+Note that you won't get fault tolerance with this approach.
 """
 
-from typing import Any, Dict
-
 import deepspeed
-from ray.air import session
-from ray.train.torch import TorchTrainer
-from ray.air.config import ScalingConfig
+import ray
 import torch
 
 from util import collate_fn, get_datasets, get_model, loss_fn, to_device
@@ -18,16 +16,13 @@ BATCH_SIZE = 8
 NUM_WORKERS = 4
 
 
-def train_loop_per_worker(config: Dict[str, Any]):
+@ray.remote(num_gpus=1)
+def train_loop_per_worker(world_size: int, rank: int):
     assert torch.cuda.is_available(), "Example workload only works with GPUs!"
 
     model, tokenizer = get_model()
 
-    ds = get_datasets(
-        tokenizer,
-        session.get_world_size(),
-        session.get_world_rank(),
-    )
+    ds = get_datasets(tokenizer, world_size, rank)
     data_loader = torch.utils.data.DataLoader(
         ds, batch_size=BATCH_SIZE, collate_fn=collate_fn,
     )
@@ -65,8 +60,8 @@ def train_loop_per_worker(config: Dict[str, Any]):
             "train_micro_batch_size_per_gpu": BATCH_SIZE,
             "wall_clock_breakdown": False,
         },
-        # TorchTrainer handled this.
-        dist_init_required=False,
+        # DeepSpeed initializes Torch DDP process group.
+        dist_init_required=True,
     )
 
     # For demo purpose, we only train 1 epoch.
@@ -83,23 +78,17 @@ def train_loop_per_worker(config: Dict[str, Any]):
         model.step()
         model.zero_grad()
 
-        session.report({
-            "step": step,
-            "loss": torch.mean(loss).detach().cpu().numpy(),
-        })
+        if rank == 0:
+            # Print stats from Rank 0 worker.
+            print(f"step: {step}, loss: {torch.mean(loss).detach().cpu().numpy()}")
 
 
 def train():
     """Main entry point."""
-    trainer = TorchTrainer(
-        train_loop_per_worker=train_loop_per_worker,
-        scaling_config=ScalingConfig(
-            num_workers=NUM_WORKERS, use_gpu=True
-        ),
-    )
-
-    result = trainer.fit()
-    print(result)
+    ray.get([
+        train_loop_per_worker.remote(NUM_WORKERS, i) for i in range(NUM_WORKERS)
+    ])
+    print("done!")
 
 
 if __name__ == "__main__":
