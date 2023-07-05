@@ -20,7 +20,7 @@ from util import (
     to_device,
 )
 
-BATCH_SIZE = 8
+BATCH_SIZE = 16
 NUM_WORKERS = 4
 
 
