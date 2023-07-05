@@ -9,6 +9,38 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 IGNORE_INDEX = -100
 
 
+def deepspeed_config(batch_size_per_gpu: int) -> dict:
+    return {
+        "optimizer": {
+            "type": "AdamW",
+            "params": {
+                "lr": 1e-5,
+            }
+        },
+        "fp16": {
+            "enabled": True
+        },
+        "bf16": {
+            # Turn this on if using AMPERE GPUs.
+            "enabled": False
+        },
+        "zero_optimization": {
+            "stage": 3,
+            "offload_optimizer": {
+                "device": "none",
+            },
+            "offload_param": {
+                "device": "none",
+            },
+        },
+        "gradient_accumulation_steps": 1,
+        "gradient_clipping": True,
+        "steps_per_print": 10,
+        "train_micro_batch_size_per_gpu": batch_size_per_gpu,
+        "wall_clock_breakdown": False,
+    }
+
+
 def get_model() -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
     MODEL = "gpt2"
 

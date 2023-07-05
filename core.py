@@ -9,7 +9,14 @@ import deepspeed
 import ray
 import torch
 
-from util import collate_fn, get_datasets, get_model, loss_fn, to_device
+from util import (
+    collate_fn,
+    deepspeed_config,
+    get_datasets,
+    get_model,
+    loss_fn,
+    to_device,
+)
 
 
 BATCH_SIZE = 8
@@ -19,6 +26,7 @@ NUM_WORKERS = 4
 @ray.remote(num_gpus=1)
 def train_loop_per_worker(world_size: int, rank: int):
     assert torch.cuda.is_available(), "Example workload only works with GPUs!"
+    assert BATCH_SIZE % world_size == 0, "Batch size must be divisible by world size!"
 
     model, tokenizer = get_model()
 
@@ -31,35 +39,7 @@ def train_loop_per_worker(world_size: int, rank: int):
         model=model,
         model_parameters=model.parameters(),
         # DeepSpeed config.
-        config={
-            "optimizer": {
-                "type": "AdamW",
-                "params": {
-                    "lr": 1e-5,
-                }
-            },
-            "fp16": {
-                "enabled": True
-            },
-            "bf16": {
-                # Turn this on if using AMPERE GPUs.
-                "enabled": False
-            },
-            "zero_optimization": {
-                "stage": 3,
-                "offload_optimizer": {
-                    "device": "none",
-                },
-                "offload_param": {
-                    "device": "none",
-                },
-            },
-            "gradient_accumulation_steps": 1,
-            "gradient_clipping": True,
-            "steps_per_print": 10,
-            "train_micro_batch_size_per_gpu": BATCH_SIZE,
-            "wall_clock_breakdown": False,
-        },
+        config=deepspeed_config(BATCH_SIZE / world_size),
         # DeepSpeed initializes Torch DDP process group.
         dist_init_required=True,
     )
