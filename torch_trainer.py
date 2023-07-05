@@ -3,6 +3,7 @@ A minimal job showing how to Fine-tune gpt2 with tiny_shakespeare dataset
 using DeepSpeed and Ray AIR's TorchTrainer.
 """
 
+import os
 from typing import Any, Dict
 
 import deepspeed
@@ -29,6 +30,7 @@ def train_loop_per_worker(config: Dict[str, Any]):
     assert BATCH_SIZE % session.get_world_size() == 0, (
         "Batch size must be divisible by world size!"
     )
+    per_gpu_batch_size = int(BATCH_SIZE / session.get_world_size())
 
     model, tokenizer = get_model()
 
@@ -38,14 +40,14 @@ def train_loop_per_worker(config: Dict[str, Any]):
         session.get_world_rank(),
     )
     data_loader = torch.utils.data.DataLoader(
-        ds, batch_size=BATCH_SIZE, collate_fn=collate_fn,
+        ds, batch_size=per_gpu_batch_size, collate_fn=collate_fn,
     )
 
     model, _, _, _ = deepspeed.initialize(
         model=model,
         model_parameters=model.parameters(),
         # DeepSpeed config.
-        config=deepspeed_config(BATCH_SIZE / session.get_world_size()),
+        config=deepspeed_config(per_gpu_batch_size),
         # TorchTrainer handled this.
         dist_init_required=False,
     )
